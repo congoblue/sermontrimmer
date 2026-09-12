@@ -236,10 +236,17 @@ class WaveformView(ttk.Frame):
         self._drag_start_t = None
         self._drag_fixed_edge = None
 
+    def _near_marker(self, x: float) -> bool:
+        if self.in_point is not None and abs(self._time_to_x(self.in_point) - x) <= MARKER_GRAB_PX:
+            return True
+        if self.out_point is not None and abs(self._time_to_x(self.out_point) - x) <= MARKER_GRAB_PX:
+            return True
+        return False
+
     def _on_hover(self, event):
         if self._dragging:
             return
-        if self._near_region_edge(event.x) is not None:
+        if self._near_marker(event.x) or self._near_region_edge(event.x) is not None:
             self.canvas.config(cursor="sb_h_double_arrow")
         else:
             self.canvas.config(cursor="")
@@ -251,6 +258,15 @@ class WaveformView(ttk.Frame):
         if self.on_cursor_change:
             self.on_cursor_change(t)
 
+    def _draw_range_tint(self, start: float, end: float, h: float, fill: str, stipple: str):
+        if end <= start or end < self.view_start or start > self.view_start + self.view_duration:
+            return
+        rs = max(start, self.view_start)
+        re = min(end, self.view_start + self.view_duration)
+        self.canvas.create_rectangle(
+            self._time_to_x(rs), 0, self._time_to_x(re), h, fill=fill, outline="", stipple=stipple
+        )
+
     def _redraw(self):
         self.canvas.delete("all")
         if not self.waveform:
@@ -259,18 +275,13 @@ class WaveformView(ttk.Frame):
         h = self.canvas.winfo_height()
         mid = h / 2
 
-        if (
-            self.region_start is not None
-            and self.region_end is not None
-            and self.region_end > self.region_start
-            and self.region_end >= self.view_start
-            and self.region_start <= self.view_start + self.view_duration
-        ):
-            rs = max(self.region_start, self.view_start)
-            re = min(self.region_end, self.view_start + self.view_duration)
-            self.canvas.create_rectangle(
-                self._time_to_x(rs), 0, self._time_to_x(re), h, fill="#2f4a63", outline=""
-            )
+        # Transcribe-region selection (blue) and the In/Out trim range
+        # (orange) are tinted with different stipple patterns so the two
+        # can overlap and both stay visible rather than one hiding the other.
+        if self.region_start is not None and self.region_end is not None:
+            self._draw_range_tint(self.region_start, self.region_end, h, "#2f6fa6", "gray25")
+        if self.in_point is not None and self.out_point is not None:
+            self._draw_range_tint(self.in_point, self.out_point, h, "#c76b1e", "gray50")
 
         peaks = self.waveform.peaks
         pps = self.waveform.peaks_per_second()

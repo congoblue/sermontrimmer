@@ -26,6 +26,7 @@ def transcribe(
     compute_type: str = "int8",
     progress_callback: Optional[Callable[[str], None]] = None,
     clip_timestamps: Optional[Sequence[float]] = None,
+    language: Optional[str] = "en",
 ) -> List[Segment]:
     """
     Transcribe an audio file and return a list of Segment objects with
@@ -37,6 +38,10 @@ def transcribe(
                      that slice of the audio; returned Segment times
                      stay relative to the full original file. Defaults
                      to the whole file.
+    language: force this language code (default "en") instead of
+              letting Whisper auto-detect it from the audio, which can
+              misfire on accented speech, singing, etc. Pass None to
+              restore auto-detection.
     """
     if progress_callback:
         progress_callback(f"Loading Whisper model '{model_size}'...")
@@ -50,6 +55,7 @@ def transcribe(
         audio_path,
         beam_size=5,
         clip_timestamps=list(clip_timestamps) if clip_timestamps else "0",
+        language=language,
     )
 
     segments: List[Segment] = []

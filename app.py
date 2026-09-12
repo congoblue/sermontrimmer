@@ -129,7 +129,7 @@ class SermonTrimmerApp:
         model_combo.pack(side="left", padx=6)
 
         self.transcribe_btn = ttk.Button(
-            model_frame, text="Transcribe", command=self.start_transcription, state="disabled"
+            model_frame, text="Transcribe Region", command=self.start_transcription, state="disabled"
         )
         self.transcribe_btn.pack(side="left", padx=10)
 
