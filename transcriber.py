@@ -4,10 +4,21 @@ transcriber.py
 Wraps faster-whisper to produce a list of timestamped segments from
 an audio file. Runs fully locally/offline once the model weights have
 been downloaded once (first run per model size needs internet).
+
+The actual Whisper call runs in a child process (see _transcribe_worker)
+rather than in-process. faster-whisper's ctranslate2 backend can abort
+the whole process with an illegal-instruction crash on CPUs that lack
+the instruction sets (e.g. AVX2) its optimized kernels assume - a fault
+Python's own try/except cannot catch, since the process dies before any
+exception is ever raised. Running it in a subprocess means that crash
+only kills the worker; this module detects it and raises a normal,
+catchable RuntimeError instead of silently taking the whole app down.
 """
 
+import multiprocessing as mp
+import queue
 from dataclasses import dataclass
-from typing import List, Callable, Optional, Sequence
+from typing import Callable, List, Optional, Sequence
 
 from faster_whisper import WhisperModel
 
@@ -17,6 +28,33 @@ class Segment:
     start: float  # seconds
     end: float    # seconds
     text: str
+
+
+def _transcribe_worker(
+    audio_path: str,
+    model_size: str,
+    device: str,
+    compute_type: str,
+    clip_timestamps: Optional[Sequence[float]],
+    language: Optional[str],
+    out_queue: "mp.Queue",
+) -> None:
+    """Runs in the child process. Only ever communicates back via out_queue."""
+    try:
+        model = WhisperModel(model_size, device=device, compute_type=compute_type)
+        segments_iter, info = model.transcribe(
+            audio_path,
+            beam_size=5,
+            clip_timestamps=list(clip_timestamps) if clip_timestamps else "0",
+            language=language,
+        )
+        raw_segments = []
+        for seg in segments_iter:
+            raw_segments.append((seg.start, seg.end, seg.text.strip()))
+            out_queue.put(("progress", f"...transcribed up to {format_timestamp(seg.end)}"))
+        out_queue.put(("done", raw_segments, info.language))
+    except Exception as e:
+        out_queue.put(("error", str(e)))
 
 
 def transcribe(
@@ -46,26 +84,55 @@ def transcribe(
     if progress_callback:
         progress_callback(f"Loading Whisper model '{model_size}'...")
 
-    model = WhisperModel(model_size, device=device, compute_type=compute_type)
+    ctx = mp.get_context("spawn")
+    out_queue: "mp.Queue" = ctx.Queue()
+    proc = ctx.Process(
+        target=_transcribe_worker,
+        args=(audio_path, model_size, device, compute_type, clip_timestamps, language, out_queue),
+        daemon=True,
+    )
+    proc.start()
 
     if progress_callback:
         progress_callback("Transcribing audio (this can take a while)...")
 
-    segments_iter, info = model.transcribe(
-        audio_path,
-        beam_size=5,
-        clip_timestamps=list(clip_timestamps) if clip_timestamps else "0",
-        language=language,
-    )
+    raw_segments: List[tuple] = []
+    result_language = None
+    error_message: Optional[str] = None
+    got_result = False
 
-    segments: List[Segment] = []
-    for seg in segments_iter:
-        segments.append(Segment(start=seg.start, end=seg.end, text=seg.text.strip()))
-        if progress_callback:
-            progress_callback(f"...transcribed up to {format_timestamp(seg.end)}")
+    while proc.is_alive() or not out_queue.empty():
+        try:
+            kind, *payload = out_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        if kind == "progress":
+            if progress_callback:
+                progress_callback(payload[0])
+        elif kind == "done":
+            raw_segments, result_language = payload
+            got_result = True
+        elif kind == "error":
+            error_message = payload[0]
+            got_result = True
+
+    proc.join()
+
+    if error_message:
+        raise RuntimeError(error_message)
+
+    if not got_result:
+        raise RuntimeError(
+            f"The transcription engine crashed unexpectedly (exit code {proc.exitcode}). "
+            "This usually means this computer's CPU doesn't support the instructions "
+            "(AVX2) the Whisper engine needs, or it ran out of memory. Try a smaller "
+            "Whisper model (tiny/base), or transcribe on a different machine."
+        )
+
+    segments = [Segment(start=s, end=e, text=t) for s, e, t in raw_segments]
 
     if progress_callback:
-        progress_callback(f"Done. {len(segments)} segments, language={info.language}")
+        progress_callback(f"Done. {len(segments)} segments, language={result_language}")
 
     return segments
 
