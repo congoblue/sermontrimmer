@@ -41,9 +41,12 @@ class WaveformView(ttk.Frame):
         self.cursor: Optional[float] = None
         self.region_start: Optional[float] = None
         self.region_end: Optional[float] = None
-        self._dragging: Optional[str] = None  # "in", "out", or "region" while a drag is active
+        # "in", "out", "region" (new selection drag), "region_start"/"region_end"
+        # (resizing an existing region's edge) while a drag is active.
+        self._dragging: Optional[str] = None
         self._drag_start_x: Optional[int] = None
         self._drag_start_t: Optional[float] = None
+        self._drag_fixed_edge: Optional[float] = None  # the region edge NOT being dragged
 
         controls = ttk.Frame(self)
         controls.pack(fill="x")
@@ -63,6 +66,7 @@ class WaveformView(ttk.Frame):
         self.canvas.bind("<Button-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<Motion>", self._on_hover)
 
     # ---------- public API ----------
 
@@ -154,11 +158,27 @@ class WaveformView(ttk.Frame):
         w = self.canvas.winfo_width()
         return self.view_start + (x / max(w, 1)) * self.view_duration
 
+    def _near_region_edge(self, x: float) -> Optional[str]:
+        if self.region_start is None or self.region_end is None:
+            return None
+        if abs(self._time_to_x(self.region_start) - x) <= MARKER_GRAB_PX:
+            return "start"
+        if abs(self._time_to_x(self.region_end) - x) <= MARKER_GRAB_PX:
+            return "end"
+        return None
+
     def _on_press(self, event):
+        edge = self._near_region_edge(event.x)
         if self.in_point is not None and abs(self._time_to_x(self.in_point) - event.x) <= MARKER_GRAB_PX:
             self._dragging = "in"
         elif self.out_point is not None and abs(self._time_to_x(self.out_point) - event.x) <= MARKER_GRAB_PX:
             self._dragging = "out"
+        elif edge == "start":
+            self._dragging = "region_start"
+            self._drag_fixed_edge = self.region_end
+        elif edge == "end":
+            self._dragging = "region_end"
+            self._drag_fixed_edge = self.region_start
         elif self.waveform:
             self._dragging = "region"
             self._drag_start_x = event.x
@@ -178,6 +198,11 @@ class WaveformView(ttk.Frame):
             self.region_end = max(self._drag_start_t, t)
             self._redraw()
             return
+        if self._dragging in ("region_start", "region_end"):
+            t = max(0.0, min(self.duration, self._x_to_time(event.x)))
+            self.region_start, self.region_end = sorted((t, self._drag_fixed_edge))
+            self._redraw()
+            return
         t = max(0.0, min(self.duration, self._x_to_time(event.x)))
         if self._dragging == "in":
             self.in_point = t
@@ -190,6 +215,9 @@ class WaveformView(ttk.Frame):
             self.on_in_change(self.in_point)
         elif self._dragging == "out" and self.out_point is not None:
             self.on_out_change(self.out_point)
+        elif self._dragging in ("region_start", "region_end"):
+            if self.on_region_change:
+                self.on_region_change(self.region_start, self.region_end)
         elif self._dragging == "region":
             moved = self._drag_start_x is not None and abs(event.x - self._drag_start_x) > DRAG_THRESHOLD_PX
             if moved:
@@ -206,6 +234,15 @@ class WaveformView(ttk.Frame):
         self._dragging = None
         self._drag_start_x = None
         self._drag_start_t = None
+        self._drag_fixed_edge = None
+
+    def _on_hover(self, event):
+        if self._dragging:
+            return
+        if self._near_region_edge(event.x) is not None:
+            self.canvas.config(cursor="sb_h_double_arrow")
+        else:
+            self.canvas.config(cursor="")
 
     def _move_cursor(self, x: float):
         t = max(0.0, min(self.duration, self._x_to_time(x)))

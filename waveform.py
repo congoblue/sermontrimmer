@@ -90,6 +90,7 @@ def load_waveform(
     cmd = [
         "ffmpeg", "-v", "error", "-i", audio_path,
         "-progress", "pipe:2",
+        "-vn",  # ignore any video track (e.g. a video file input)
         "-f", "s16le", "-acodec", "pcm_s16le",
         "-ar", str(DECODE_SAMPLE_RATE), "-ac", "1",
         "pipe:1",

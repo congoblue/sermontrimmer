@@ -2,7 +2,9 @@
 app.py
 
 Sermon Trimmer - simple desktop tool:
-1. Open an audio recording of a church service.
+1. Open an audio or video recording of a church service (if a video
+   file is opened, its video track is ignored and only the audio is
+   used).
 2. Optionally click a start point, or drag to select a region, on the
    waveform before transcribing: Transcribe then only processes from
    that cursor point (or within that region) instead of the whole
@@ -72,8 +74,6 @@ class SermonTrimmerApp:
         self.file_label = ttk.Label(top, text="No file loaded")
         self.file_label.pack(side="left", padx=10)
 
-        self.status_label = ttk.Label(self.root, text="", padding=(8, 4), foreground="#555")
-        self.status_label.pack(fill="x")
         self.waveform_status_label = ttk.Label(self.root, text="", padding=(8, 0), foreground="#555")
         self.waveform_status_label.pack(fill="x")
 
@@ -87,14 +87,13 @@ class SermonTrimmerApp:
         )
         self.waveform_view.pack(fill="x", padx=8, pady=(4, 8))
 
-        # In/Out controls (set from transcript selection or waveform cursor)
+        # In/Out controls: use the selected transcript row if there is one,
+        # otherwise fall back to the waveform cursor/region.
         io_frame = ttk.Frame(self.root, padding=8)
         io_frame.pack(fill="x")
 
-        ttk.Button(io_frame, text="Set In (segment start)", command=self.set_in_from_transcript).pack(side="left")
-        ttk.Button(io_frame, text="Set Out (segment end)", command=self.set_out_from_transcript).pack(side="left", padx=6)
-        ttk.Button(io_frame, text="Set In (cursor/region)", command=self.set_in_from_cursor).pack(side="left", padx=(20, 0))
-        ttk.Button(io_frame, text="Set Out (cursor/region)", command=self.set_out_from_cursor).pack(side="left", padx=6)
+        ttk.Button(io_frame, text="Set In", command=self.set_in_from_transcript).pack(side="left")
+        ttk.Button(io_frame, text="Set Out", command=self.set_out_from_transcript).pack(side="left", padx=6)
 
         self.io_label = ttk.Label(io_frame, text="In: --   Out: --   Cursor: --")
         self.io_label.pack(side="left", padx=20)
@@ -134,6 +133,9 @@ class SermonTrimmerApp:
         )
         self.transcribe_btn.pack(side="left", padx=10)
 
+        self.status_label = ttk.Label(self.root, text="", padding=(8, 4), foreground="#555")
+        self.status_label.pack(fill="x")
+
         # Transcript table
         columns = ("start", "end", "text")
         self.tree = ttk.Treeview(self.root, columns=columns, show="headings", selectmode="browse", height=10)
@@ -169,9 +171,16 @@ class SermonTrimmerApp:
     # ---------- File loading ----------
 
     def open_file(self):
+        audio_exts = "*.mp3 *.wav *.m4a *.aac *.flac *.ogg"
+        video_exts = "*.mp4 *.mov *.mkv *.avi *.m4v *.wmv *.webm"
         path = filedialog.askopenfilename(
-            title="Select audio recording",
-            filetypes=[("Audio files", "*.mp3 *.wav *.m4a *.aac *.flac *.ogg"), ("All files", "*.*")],
+            title="Select audio or video recording",
+            filetypes=[
+                ("Audio/Video files", f"{audio_exts} {video_exts}"),
+                ("Audio files", audio_exts),
+                ("Video files", video_exts),
+                ("All files", "*.*"),
+            ],
         )
         if not path:
             return
@@ -276,7 +285,6 @@ class SermonTrimmerApp:
     def _selected_segment(self) -> Optional[Segment]:
         sel = self.tree.selection()
         if not sel:
-            messagebox.showinfo("No selection", "Click a row in the transcript first.")
             return None
         return self.segments[int(sel[0])]
 
@@ -284,11 +292,17 @@ class SermonTrimmerApp:
         seg = self._selected_segment()
         if seg is not None:
             self._set_in(seg.start)
+            return
+        # No transcript row highlighted (e.g. the cursor sits outside the
+        # transcribed range) - fall back to the waveform cursor/region.
+        self.set_in_from_cursor()
 
     def set_out_from_transcript(self):
         seg = self._selected_segment()
         if seg is not None:
             self._set_out(seg.end)
+            return
+        self.set_out_from_cursor()
 
     def set_in_from_cursor(self):
         if self.region_start is not None and self.region_end is not None:
@@ -328,6 +342,9 @@ class SermonTrimmerApp:
         self._select_segment_at(t)
 
     def _select_segment_at(self, t: float):
+        if not self.segments or t < self.segments[0].start or t > self.segments[-1].end:
+            self.tree.selection_set()
+            return
         idx = None
         for i, seg in enumerate(self.segments):
             if seg.start <= t:
@@ -335,6 +352,7 @@ class SermonTrimmerApp:
             else:
                 break
         if idx is None:
+            self.tree.selection_set()
             return
         iid = str(idx)
         self.tree.selection_set(iid)
@@ -407,14 +425,29 @@ class SermonTrimmerApp:
         )
         if not out_path:
             return
+        self.export_btn.config(state="disabled")
+        self.status_label.config(text="Outputting file, please wait...")
+        threading.Thread(target=self._run_export, args=(out_path,), daemon=True).start()
+
+    def _run_export(self, out_path: str):
         try:
             export_trimmed_mp3(
                 self.audio_path, out_path, self.in_point, self.out_point,
                 sample_rate=22050, channels=1, bitrate="32k",
             )
         except Exception as e:
-            messagebox.showerror("Export failed", str(e))
+            self.root.after(0, lambda: self._on_export_failed(str(e)))
             return
+        self.root.after(0, lambda: self._on_export_done(out_path))
+
+    def _on_export_failed(self, message: str):
+        self.status_label.config(text="")
+        self._sync_markers()
+        messagebox.showerror("Export failed", message)
+
+    def _on_export_done(self, out_path: str):
+        self.status_label.config(text="")
+        self._sync_markers()
         messagebox.showinfo("Done", f"Saved: {out_path}")
 
 

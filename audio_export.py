@@ -1,8 +1,9 @@
 """
 audio_export.py
 
-Trims an audio file to an in/out time range and converts it to
-22050 Hz mono MP3 using ffmpeg (must be installed and on PATH).
+Trims an audio (or video) file to an in/out time range and converts
+its audio track to 22050 Hz mono MP3 using ffmpeg (must be installed
+and on PATH). Any video track on the input is ignored.
 """
 
 import shutil
@@ -47,6 +48,7 @@ def export_trimmed_mp3(
         "-ss", f"{start_seconds:.3f}",   # seek to in-point (fast + accurate for audio)
         "-i", input_path,
         "-t", f"{duration:.3f}",         # clip length
+        "-vn",                           # ignore any video track (e.g. a video file input)
         "-ar", str(sample_rate),         # resample rate
         "-ac", str(channels),            # channel count (1 = mono)
         "-codec:a", "libmp3lame",
