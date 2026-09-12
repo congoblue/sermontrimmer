@@ -68,3 +68,41 @@ python app.py
 - The `ddmmyyRS.mp3` naming and 32 kbps/22050 Hz/mono settings are set
   as defaults in `app.py` / `audio_export.py` if you ever want to
   change the convention.
+
+## Troubleshooting
+
+- **Transcribe crashes with no error message / the app just vanishes.**
+  Transcription runs faster-whisper's Whisper model in a separate
+  worker process (see `transcriber.py`), specifically so that if that
+  native code crashes, the app can catch it and show a proper error
+  dialog instead of silently dying. If you see an error dialog naming
+  a Windows crash code (e.g. "access violation" / "illegal
+  instruction"), that's this safety net working as intended — the
+  message it shows explains what the code means and what to try.
+
+- **"An access violation" during Transcribe, even on a CPU that
+  supports AVX2.** This has been traced (on a Windows 10th-gen Intel
+  machine) to a missing/outdated **Microsoft Visual C++
+  Redistributable** — ctranslate2 (faster-whisper's backend) depends
+  on it, and without it the native model-loading code can crash the
+  moment it initializes, even though the DLL itself loads fine.
+  Install/repair the latest x64 redistributable directly from
+  Microsoft: https://aka.ms/vs/17/release/vc_redist.x64.exe — this
+  fixed the issue in practice and is the first thing to try for this
+  particular crash.
+
+- **"An illegal instruction" during Transcribe.** This usually means
+  the CPU itself doesn't support an instruction set (e.g. AVX2) that
+  ctranslate2's optimized code needs. Try a smaller Whisper model, or
+  transcribe on a different machine.
+
+- **Still crashing after the above?** Try clearing the cached model
+  weights and letting them re-download (rules out a corrupted/partial
+  download):
+  ```
+  rmdir /s /q "%USERPROFILE%\.cache\huggingface\hub"
+  ```
+  or reinstall the transcription backend:
+  ```
+  pip install --force-reinstall faster-whisper ctranslate2
+  ```

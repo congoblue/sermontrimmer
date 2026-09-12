@@ -233,6 +233,8 @@ class SermonTrimmerApp:
             return
         self.transcribe_btn.config(state="disabled")
         self.open_btn.config(state="disabled")
+        self.segments = []
+        self.tree.delete(*self.tree.get_children())
         clip = self._clip_timestamps()
         if clip and len(clip) == 2:
             self.status_label.config(
@@ -253,12 +255,16 @@ class SermonTrimmerApp:
         def progress(msg: str):
             self.root.after(0, lambda: self.status_label.config(text=msg))
 
+        def on_segment(seg: Segment):
+            self.root.after(0, lambda: self._append_segment(seg))
+
         try:
-            segments = transcribe(
+            transcribe(
                 self.audio_path,
                 model_size=self.model_var.get(),
                 progress_callback=progress,
                 clip_timestamps=self._clip_timestamps(),
+                on_segment=on_segment,
             )
         except Exception as e:
             self.root.after(0, lambda: messagebox.showerror("Transcription failed", str(e)))
@@ -266,16 +272,21 @@ class SermonTrimmerApp:
             self.root.after(0, lambda: self.open_btn.config(state="normal"))
             return
 
-        self.segments = segments
-        self.root.after(0, self._populate_tree)
+        self.root.after(0, self._on_transcription_done)
 
-    def _populate_tree(self):
-        self.tree.delete(*self.tree.get_children())
-        for i, seg in enumerate(self.segments):
-            self.tree.insert(
-                "", "end", iid=str(i),
-                values=(format_timestamp(seg.start), format_timestamp(seg.end), seg.text),
-            )
+    def _append_segment(self, seg: Segment):
+        # Appended (and the tree row inserted) on the main thread only, via
+        # root.after, so this never races with _on_transcription_done.
+        idx = len(self.segments)
+        self.segments.append(seg)
+        iid = str(idx)
+        self.tree.insert(
+            "", "end", iid=iid,
+            values=(format_timestamp(seg.start), format_timestamp(seg.end), seg.text),
+        )
+        self.tree.see(iid)
+
+    def _on_transcription_done(self):
         self.transcribe_btn.config(state="normal")
         self.open_btn.config(state="normal")
         self.status_label.config(

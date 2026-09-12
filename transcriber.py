@@ -91,11 +91,9 @@ def _transcribe_worker(
             clip_timestamps=list(clip_timestamps) if clip_timestamps else "0",
             language=language,
         )
-        raw_segments = []
         for seg in segments_iter:
-            raw_segments.append((seg.start, seg.end, seg.text.strip()))
-            out_queue.put(("progress", f"...transcribed up to {format_timestamp(seg.end)}"))
-        out_queue.put(("done", raw_segments, info.language))
+            out_queue.put(("segment", seg.start, seg.end, seg.text.strip()))
+        out_queue.put(("done", info.language))
     except Exception as e:
         out_queue.put(("error", str(e)))
 
@@ -108,6 +106,7 @@ def transcribe(
     progress_callback: Optional[Callable[[str], None]] = None,
     clip_timestamps: Optional[Sequence[float]] = None,
     language: Optional[str] = "en",
+    on_segment: Optional[Callable[[Segment], None]] = None,
 ) -> List[Segment]:
     """
     Transcribe an audio file and return a list of Segment objects with
@@ -123,6 +122,9 @@ def transcribe(
               letting Whisper auto-detect it from the audio, which can
               misfire on accented speech, singing, etc. Pass None to
               restore auto-detection.
+    on_segment: called with each Segment as soon as it's transcribed,
+                so callers can show the transcript growing live instead
+                of waiting for the whole file to finish.
     """
     if progress_callback:
         progress_callback(f"Loading Whisper model '{model_size}'...")
@@ -139,7 +141,7 @@ def transcribe(
     if progress_callback:
         progress_callback("Transcribing audio (this can take a while)...")
 
-    raw_segments: List[tuple] = []
+    segments: List[Segment] = []
     result_language = None
     error_message: Optional[str] = None
     got_result = False
@@ -149,11 +151,16 @@ def transcribe(
             kind, *payload = out_queue.get(timeout=0.5)
         except queue.Empty:
             continue
-        if kind == "progress":
+        if kind == "segment":
+            start, end, text = payload
+            seg = Segment(start=start, end=end, text=text)
+            segments.append(seg)
             if progress_callback:
-                progress_callback(payload[0])
+                progress_callback(f"...transcribed up to {format_timestamp(end)}")
+            if on_segment:
+                on_segment(seg)
         elif kind == "done":
-            raw_segments, result_language = payload
+            result_language = payload[0]
             got_result = True
         elif kind == "error":
             error_message = payload[0]
@@ -168,8 +175,6 @@ def transcribe(
         raise RuntimeError(
             "The transcription engine crashed unexpectedly: " + _describe_crash(proc.exitcode)
         )
-
-    segments = [Segment(start=s, end=e, text=t) for s, e, t in raw_segments]
 
     if progress_callback:
         progress_callback(f"Done. {len(segments)} segments, language={result_language}")
