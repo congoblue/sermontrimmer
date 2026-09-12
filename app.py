@@ -3,10 +3,16 @@ app.py
 
 Sermon Trimmer - simple desktop tool:
 1. Open an audio recording of a church service.
-2. Transcribe it locally with Whisper (via faster-whisper).
-3. Pick In/Out points from the transcript, fine-tune on a zoomable
-   waveform (drag the markers, or nudge them in small steps).
-4. Export the selected range as a 22050 Hz mono, 32 kbps MP3, named
+2. Optionally click a start point, or drag to select a region, on the
+   waveform before transcribing: Transcribe then only processes from
+   that cursor point (or within that region) instead of the whole
+   file.
+3. Transcribe it locally with Whisper (via faster-whisper).
+4. Pick In/Out points from the transcript, or by clicking/dragging a
+   cursor on a zoomable waveform (which scrolls and highlights the
+   matching transcript line); fine-tune by dragging the In/Out
+   markers or nudging them in small steps.
+5. Export the selected range as a 22050 Hz mono, 32 kbps MP3, named
    ddmmyyRS.mp3 by default (nearest Sunday's date + "RS").
 
 Run with: python app.py
@@ -48,6 +54,9 @@ class SermonTrimmerApp:
         self.segments: List[Segment] = []
         self.in_point: Optional[float] = None
         self.out_point: Optional[float] = None
+        self.cursor_point: Optional[float] = None
+        self.region_start: Optional[float] = None
+        self.region_end: Optional[float] = None
 
         self._build_ui()
 
@@ -63,56 +72,35 @@ class SermonTrimmerApp:
         self.file_label = ttk.Label(top, text="No file loaded")
         self.file_label.pack(side="left", padx=10)
 
-        model_frame = ttk.Frame(self.root, padding=(8, 0))
-        model_frame.pack(fill="x")
-        ttk.Label(model_frame, text="Whisper model:").pack(side="left")
-        self.model_var = tk.StringVar(value="base")
-        model_combo = ttk.Combobox(
-            model_frame, textvariable=self.model_var, state="readonly",
-            values=["tiny", "base", "small", "medium", "large-v3"], width=12,
-        )
-        model_combo.pack(side="left", padx=6)
-
-        self.transcribe_btn = ttk.Button(
-            model_frame, text="Transcribe", command=self.start_transcription, state="disabled"
-        )
-        self.transcribe_btn.pack(side="left", padx=10)
-
         self.status_label = ttk.Label(self.root, text="", padding=(8, 4), foreground="#555")
         self.status_label.pack(fill="x")
         self.waveform_status_label = ttk.Label(self.root, text="", padding=(8, 0), foreground="#555")
         self.waveform_status_label.pack(fill="x")
 
-        # Transcript table
-        columns = ("start", "end", "text")
-        self.tree = ttk.Treeview(self.root, columns=columns, show="headings", selectmode="browse", height=10)
-        self.tree.heading("start", text="Start")
-        self.tree.heading("end", text="End")
-        self.tree.heading("text", text="Text")
-        self.tree.column("start", width=90, anchor="center")
-        self.tree.column("end", width=90, anchor="center")
-        self.tree.column("text", width=620, anchor="w")
-        self.tree.pack(fill="both", expand=True, padx=8, pady=4)
-
-        tree_scroll = ttk.Scrollbar(self.tree, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=tree_scroll.set)
-        tree_scroll.pack(side="right", fill="y")
-
         # Waveform preview
         self.waveform_view = WaveformView(
-            self.root, on_in_change=self._set_in, on_out_change=self._set_out
+            self.root,
+            on_in_change=self._set_in,
+            on_out_change=self._set_out,
+            on_cursor_change=self._on_cursor_change,
+            on_region_change=self._on_region_change,
         )
         self.waveform_view.pack(fill="x", padx=8, pady=(4, 8))
 
-        # In/Out controls (set from transcript selection)
+        # In/Out controls (set from transcript selection or waveform cursor)
         io_frame = ttk.Frame(self.root, padding=8)
         io_frame.pack(fill="x")
 
         ttk.Button(io_frame, text="Set In (segment start)", command=self.set_in_from_transcript).pack(side="left")
         ttk.Button(io_frame, text="Set Out (segment end)", command=self.set_out_from_transcript).pack(side="left", padx=6)
+        ttk.Button(io_frame, text="Set In (cursor/region)", command=self.set_in_from_cursor).pack(side="left", padx=(20, 0))
+        ttk.Button(io_frame, text="Set Out (cursor/region)", command=self.set_out_from_cursor).pack(side="left", padx=6)
 
-        self.io_label = ttk.Label(io_frame, text="In: --   Out: --")
+        self.io_label = ttk.Label(io_frame, text="In: --   Out: --   Cursor: --")
         self.io_label.pack(side="left", padx=20)
+
+        self.region_label = ttk.Label(io_frame, text="Region: whole file")
+        self.region_label.pack(side="left", padx=6)
 
         # Nudge controls (fine adjustment in small steps)
         nudge_frame = ttk.Frame(self.root, padding=(8, 0))
@@ -129,6 +117,39 @@ class SermonTrimmerApp:
             ttk.Button(nudge_frame, text=label, width=5, command=lambda d=delta: self._nudge_out(d)).pack(
                 side="left", padx=2
             )
+
+        # Whisper model / transcribe controls (sit directly above the transcript)
+        model_frame = ttk.Frame(self.root, padding=8)
+        model_frame.pack(fill="x")
+        ttk.Label(model_frame, text="Whisper model:").pack(side="left")
+        self.model_var = tk.StringVar(value="base")
+        model_combo = ttk.Combobox(
+            model_frame, textvariable=self.model_var, state="readonly",
+            values=["tiny", "base", "small", "medium", "large-v3"], width=12,
+        )
+        model_combo.pack(side="left", padx=6)
+
+        self.transcribe_btn = ttk.Button(
+            model_frame, text="Transcribe", command=self.start_transcription, state="disabled"
+        )
+        self.transcribe_btn.pack(side="left", padx=10)
+
+        # Transcript table
+        columns = ("start", "end", "text")
+        self.tree = ttk.Treeview(self.root, columns=columns, show="headings", selectmode="browse", height=10)
+        self.tree.heading("start", text="Start")
+        self.tree.heading("end", text="End")
+        self.tree.heading("text", text="Text")
+        self.tree.column("start", width=90, anchor="center")
+        self.tree.column("end", width=90, anchor="center")
+        self.tree.column("text", width=620, anchor="w")
+        self.tree.pack(fill="both", expand=True, padx=8, pady=4)
+
+        tree_scroll = ttk.Scrollbar(self.tree, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=tree_scroll.set)
+        tree_scroll.pack(side="right", fill="y")
+
+        self.tree.bind("<Button-1>", self._on_transcript_click, add="+")
 
         export_frame = ttk.Frame(self.root, padding=8)
         export_frame.pack(fill="x")
@@ -162,7 +183,11 @@ class SermonTrimmerApp:
         self.tree.delete(*self.tree.get_children())
         self.in_point = None
         self.out_point = None
-        self.io_label.config(text="In: --   Out: --")
+        self.cursor_point = None
+        self.region_start = None
+        self.region_end = None
+        self.io_label.config(text="In: --   Out: --   Cursor: --")
+        self.region_label.config(text="Region: whole file")
         self.export_btn.config(state="disabled")
         self.waveform_view.clear()
         self.status_label.config(text="")
@@ -172,12 +197,15 @@ class SermonTrimmerApp:
     # ---------- Waveform ----------
 
     def start_waveform_load(self):
-        self.waveform_status_label.config(text="Loading waveform...")
+        self.waveform_status_label.config(text="Loading waveform... 0%")
         threading.Thread(target=self._run_waveform_load, daemon=True).start()
 
     def _run_waveform_load(self):
+        def progress(pct: float):
+            self.root.after(0, lambda: self.waveform_status_label.config(text=f"Loading waveform... {pct:.0f}%"))
+
         try:
-            waveform = load_waveform(self.audio_path)
+            waveform = load_waveform(self.audio_path, progress_callback=progress)
         except Exception as e:
             self.root.after(0, lambda: self.waveform_status_label.config(text=f"Waveform failed: {e}"))
             return
@@ -196,7 +224,21 @@ class SermonTrimmerApp:
             return
         self.transcribe_btn.config(state="disabled")
         self.open_btn.config(state="disabled")
+        clip = self._clip_timestamps()
+        if clip and len(clip) == 2:
+            self.status_label.config(
+                text=f"Transcribing {format_timestamp(clip[0])} - {format_timestamp(clip[1])}..."
+            )
+        else:
+            self.status_label.config(text="Transcribing whole file...")
         threading.Thread(target=self._run_transcription, daemon=True).start()
+
+    def _clip_timestamps(self) -> Optional[List[float]]:
+        if self.region_start is not None and self.region_end is not None:
+            return [self.region_start, self.region_end]
+        if self.cursor_point is not None and self.cursor_point > 0 and self.duration:
+            return [self.cursor_point, self.duration]
+        return None
 
     def _run_transcription(self):
         def progress(msg: str):
@@ -204,7 +246,10 @@ class SermonTrimmerApp:
 
         try:
             segments = transcribe(
-                self.audio_path, model_size=self.model_var.get(), progress_callback=progress
+                self.audio_path,
+                model_size=self.model_var.get(),
+                progress_callback=progress,
+                clip_timestamps=self._clip_timestamps(),
             )
         except Exception as e:
             self.root.after(0, lambda: messagebox.showerror("Transcription failed", str(e)))
@@ -245,6 +290,68 @@ class SermonTrimmerApp:
         if seg is not None:
             self._set_out(seg.end)
 
+    def set_in_from_cursor(self):
+        if self.region_start is not None and self.region_end is not None:
+            self._set_in(self.region_start)
+            return
+        if self.cursor_point is None:
+            messagebox.showinfo("No cursor yet", "Click a position on the waveform first.")
+            return
+        self._set_in(self.cursor_point)
+
+    def set_out_from_cursor(self):
+        if self.region_start is not None and self.region_end is not None:
+            self._set_out(self.region_end)
+            return
+        if self.cursor_point is None:
+            messagebox.showinfo("No cursor yet", "Click a position on the waveform first.")
+            return
+        self._set_out(self.cursor_point)
+
+    def _on_transcript_click(self, event):
+        row_id = self.tree.identify_row(event.y)
+        if not row_id:
+            return
+        idx = int(row_id)
+        if not (0 <= idx < len(self.segments)):
+            return
+        t = self.segments[idx].start
+        self.cursor_point = t
+        self._sync_markers()
+        self.waveform_view.set_cursor(t)
+
+    # ---------- Waveform cursor ----------
+
+    def _on_cursor_change(self, t: float):
+        self.cursor_point = t
+        self._sync_markers()
+        self._select_segment_at(t)
+
+    def _select_segment_at(self, t: float):
+        idx = None
+        for i, seg in enumerate(self.segments):
+            if seg.start <= t:
+                idx = i
+            else:
+                break
+        if idx is None:
+            return
+        iid = str(idx)
+        self.tree.selection_set(iid)
+        self.tree.see(iid)
+
+    # ---------- Waveform region selection ----------
+
+    def _on_region_change(self, start: Optional[float], end: Optional[float]):
+        self.region_start = start
+        self.region_end = end
+        if start is None or end is None:
+            self.region_label.config(text="Region: whole file")
+        else:
+            self.region_label.config(
+                text=f"Region: {format_timestamp(start)} - {format_timestamp(end)}"
+            )
+
     # ---------- In/Out point management (shared by transcript, waveform drag, nudge) ----------
 
     def _set_in(self, t: float):
@@ -276,7 +383,8 @@ class SermonTrimmerApp:
     def _sync_markers(self):
         in_str = format_timestamp(self.in_point) if self.in_point is not None else "--"
         out_str = format_timestamp(self.out_point) if self.out_point is not None else "--"
-        self.io_label.config(text=f"In: {in_str}   Out: {out_str}")
+        cursor_str = format_timestamp(self.cursor_point) if self.cursor_point is not None else "--"
+        self.io_label.config(text=f"In: {in_str}   Out: {out_str}   Cursor: {cursor_str}")
         valid = (
             self.in_point is not None
             and self.out_point is not None

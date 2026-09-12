@@ -7,7 +7,7 @@ been downloaded once (first run per model size needs internet).
 """
 
 from dataclasses import dataclass
-from typing import List, Callable, Optional
+from typing import List, Callable, Optional, Sequence
 
 from faster_whisper import WhisperModel
 
@@ -25,6 +25,7 @@ def transcribe(
     device: str = "cpu",
     compute_type: str = "int8",
     progress_callback: Optional[Callable[[str], None]] = None,
+    clip_timestamps: Optional[Sequence[float]] = None,
 ) -> List[Segment]:
     """
     Transcribe an audio file and return a list of Segment objects with
@@ -32,6 +33,10 @@ def transcribe(
 
     model_size: one of "tiny", "base", "small", "medium", "large-v3".
                 Bigger = more accurate but slower and needs more RAM.
+    clip_timestamps: optional [start, end] (seconds) to only transcribe
+                     that slice of the audio; returned Segment times
+                     stay relative to the full original file. Defaults
+                     to the whole file.
     """
     if progress_callback:
         progress_callback(f"Loading Whisper model '{model_size}'...")
@@ -41,7 +46,11 @@ def transcribe(
     if progress_callback:
         progress_callback("Transcribing audio (this can take a while)...")
 
-    segments_iter, info = model.transcribe(audio_path, beam_size=5)
+    segments_iter, info = model.transcribe(
+        audio_path,
+        beam_size=5,
+        clip_timestamps=list(clip_timestamps) if clip_timestamps else "0",
+    )
 
     segments: List[Segment] = []
     for seg in segments_iter:

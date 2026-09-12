@@ -2,7 +2,8 @@
 waveform_view.py
 
 A zoomable, pannable waveform Canvas widget with draggable In/Out
-markers. Pure Tkinter (no matplotlib/numpy) so it stays lightweight.
+markers, a clickable playback cursor, and drag-to-select a region.
+Pure Tkinter (no matplotlib/numpy) so it stays lightweight.
 """
 
 import tkinter as tk
@@ -12,6 +13,7 @@ from typing import Callable, Optional
 from waveform import Waveform
 
 MARKER_GRAB_PX = 6  # how close (in pixels) a click must be to grab a marker
+DRAG_THRESHOLD_PX = 4  # movement below this is treated as a click, not a region drag
 
 
 class WaveformView(ttk.Frame):
@@ -20,11 +22,15 @@ class WaveformView(ttk.Frame):
         parent,
         on_in_change: Callable[[float], None],
         on_out_change: Callable[[float], None],
+        on_cursor_change: Optional[Callable[[float], None]] = None,
+        on_region_change: Optional[Callable[[Optional[float], Optional[float]], None]] = None,
         height: int = 150,
     ):
         super().__init__(parent)
         self.on_in_change = on_in_change
         self.on_out_change = on_out_change
+        self.on_cursor_change = on_cursor_change
+        self.on_region_change = on_region_change
 
         self.waveform: Optional[Waveform] = None
         self.duration = 0.0
@@ -32,7 +38,12 @@ class WaveformView(ttk.Frame):
         self.view_duration = 0.0
         self.in_point: Optional[float] = None
         self.out_point: Optional[float] = None
-        self._dragging: Optional[str] = None  # "in" or "out" while a drag is active
+        self.cursor: Optional[float] = None
+        self.region_start: Optional[float] = None
+        self.region_end: Optional[float] = None
+        self._dragging: Optional[str] = None  # "in", "out", or "region" while a drag is active
+        self._drag_start_x: Optional[int] = None
+        self._drag_start_t: Optional[float] = None
 
         controls = ttk.Frame(self)
         controls.pack(fill="x")
@@ -67,6 +78,15 @@ class WaveformView(ttk.Frame):
         self.out_point = out_point
         self._redraw()
 
+    def set_cursor(self, t: Optional[float]):
+        self.cursor = t
+        self._redraw()
+
+    def clear_region(self):
+        self.region_start = None
+        self.region_end = None
+        self._redraw()
+
     def clear(self):
         self.waveform = None
         self.duration = 0.0
@@ -74,6 +94,9 @@ class WaveformView(ttk.Frame):
         self.view_duration = 0.0
         self.in_point = None
         self.out_point = None
+        self.cursor = None
+        self.region_start = None
+        self.region_end = None
         self.canvas.delete("all")
         self.scrollbar.set(0, 1)
 
@@ -136,11 +159,24 @@ class WaveformView(ttk.Frame):
             self._dragging = "in"
         elif self.out_point is not None and abs(self._time_to_x(self.out_point) - event.x) <= MARKER_GRAB_PX:
             self._dragging = "out"
+        elif self.waveform:
+            self._dragging = "region"
+            self._drag_start_x = event.x
+            self._drag_start_t = max(0.0, min(self.duration, self._x_to_time(event.x)))
+            self.region_start = self._drag_start_t
+            self.region_end = self._drag_start_t
+            self._redraw()
         else:
             self._dragging = None
 
     def _on_drag(self, event):
         if not self._dragging or not self.waveform:
+            return
+        if self._dragging == "region":
+            t = max(0.0, min(self.duration, self._x_to_time(event.x)))
+            self.region_start = min(self._drag_start_t, t)
+            self.region_end = max(self._drag_start_t, t)
+            self._redraw()
             return
         t = max(0.0, min(self.duration, self._x_to_time(event.x)))
         if self._dragging == "in":
@@ -154,7 +190,29 @@ class WaveformView(ttk.Frame):
             self.on_in_change(self.in_point)
         elif self._dragging == "out" and self.out_point is not None:
             self.on_out_change(self.out_point)
+        elif self._dragging == "region":
+            moved = self._drag_start_x is not None and abs(event.x - self._drag_start_x) > DRAG_THRESHOLD_PX
+            if moved:
+                if self.on_region_change:
+                    self.on_region_change(self.region_start, self.region_end)
+            else:
+                # Not a real drag: treat as a plain click that moves the cursor
+                # and clears any previously selected region.
+                self.region_start = None
+                self.region_end = None
+                if self.on_region_change:
+                    self.on_region_change(None, None)
+                self._move_cursor(self._drag_start_x)
         self._dragging = None
+        self._drag_start_x = None
+        self._drag_start_t = None
+
+    def _move_cursor(self, x: float):
+        t = max(0.0, min(self.duration, self._x_to_time(x)))
+        self.cursor = t
+        self._redraw()
+        if self.on_cursor_change:
+            self.on_cursor_change(t)
 
     def _redraw(self):
         self.canvas.delete("all")
@@ -163,6 +221,19 @@ class WaveformView(ttk.Frame):
         w = self.canvas.winfo_width()
         h = self.canvas.winfo_height()
         mid = h / 2
+
+        if (
+            self.region_start is not None
+            and self.region_end is not None
+            and self.region_end > self.region_start
+            and self.region_end >= self.view_start
+            and self.region_start <= self.view_start + self.view_duration
+        ):
+            rs = max(self.region_start, self.view_start)
+            re = min(self.region_end, self.view_start + self.view_duration)
+            self.canvas.create_rectangle(
+                self._time_to_x(rs), 0, self._time_to_x(re), h, fill="#2f4a63", outline=""
+            )
 
         peaks = self.waveform.peaks
         pps = self.waveform.peaks_per_second()
@@ -192,6 +263,9 @@ class WaveformView(ttk.Frame):
         if self.out_point is not None and self.view_start <= self.out_point <= self.view_start + self.view_duration:
             x = self._time_to_x(self.out_point)
             self.canvas.create_line(x, 0, x, h, fill="#ffca28", width=2)
+        if self.cursor is not None and self.view_start <= self.cursor <= self.view_start + self.view_duration:
+            x = self._time_to_x(self.cursor)
+            self.canvas.create_line(x, 0, x, h, fill="#ffffff", width=1)
 
         self._update_scrollbar()
 
