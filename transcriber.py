@@ -30,6 +30,49 @@ class Segment:
     text: str
 
 
+# Common Windows crash codes (NTSTATUS values) the worker process can exit
+# with, and what they usually mean for a native library like ctranslate2.
+_WINDOWS_CRASH_CODES = {
+    0xC0000005: (
+        "an access violation",
+        "This is usually caused by a corrupted or incomplete Whisper model "
+        "download, or a faster-whisper/ctranslate2 install that isn't "
+        "compatible with this machine. Try deleting the cached model under "
+        "%USERPROFILE%\\.cache\\huggingface\\hub and letting it re-download, "
+        "or reinstall with: pip install --force-reinstall faster-whisper ctranslate2",
+    ),
+    0xC000001D: (
+        "an illegal instruction",
+        "This usually means this computer's CPU doesn't support an "
+        "instruction set (e.g. AVX2) the Whisper engine's optimized code "
+        "needs. Try a smaller Whisper model, or transcribe on a different machine.",
+    ),
+    0xC00000FD: (
+        "a stack overflow",
+        "Try a smaller Whisper model or a shorter audio clip/region.",
+    ),
+    0xC0000409: (
+        "a stack buffer overrun",
+        "Try reinstalling faster-whisper: pip install --force-reinstall faster-whisper ctranslate2",
+    ),
+}
+
+
+def _describe_crash(exitcode: Optional[int]) -> str:
+    if exitcode is None:
+        return "it did not exit cleanly."
+    if exitcode < 0:
+        return f"it was terminated by signal {-exitcode}."
+    match = _WINDOWS_CRASH_CODES.get(exitcode & 0xFFFFFFFF)
+    if match:
+        name, hint = match
+        return f"it crashed with {name} (exit code {exitcode}). {hint}"
+    return (
+        f"it exited with code {exitcode}. Try a smaller Whisper model, or "
+        "reinstall faster-whisper: pip install --force-reinstall faster-whisper ctranslate2"
+    )
+
+
 def _transcribe_worker(
     audio_path: str,
     model_size: str,
@@ -123,10 +166,7 @@ def transcribe(
 
     if not got_result:
         raise RuntimeError(
-            f"The transcription engine crashed unexpectedly (exit code {proc.exitcode}). "
-            "This usually means this computer's CPU doesn't support the instructions "
-            "(AVX2) the Whisper engine needs, or it ran out of memory. Try a smaller "
-            "Whisper model (tiny/base), or transcribe on a different machine."
+            "The transcription engine crashed unexpectedly: " + _describe_crash(proc.exitcode)
         )
 
     segments = [Segment(start=s, end=e, text=t) for s, e, t in raw_segments]
