@@ -22,6 +22,7 @@ Run with: python app.py
 
 import os
 import threading
+import time
 from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -29,8 +30,11 @@ from typing import List, Optional
 
 from transcriber import transcribe, format_timestamp, Segment
 from audio_export import export_trimmed_mp3, check_ffmpeg_available
+from audio_player import decode_to_wav, Player, PLAYBACK_AVAILABLE
 from waveform import load_waveform
 from waveform_view import WaveformView
+
+PLAYBACK_TICK_MS = 50  # how often the cursor/transcript follow the playhead
 
 NUDGE_STEPS = [("-1s", -1.0), ("-0.1s", -0.1), ("+0.1s", 0.1), ("+1s", 1.0)]
 
@@ -60,7 +64,16 @@ class SermonTrimmerApp:
         self.region_start: Optional[float] = None
         self.region_end: Optional[float] = None
 
+        self.player: Optional[Player] = None
+        self.play_state: str = "stopped"  # "stopped" | "playing" | "paused"
+        self._playback_origin: Optional[float] = None  # cursor to restore on Stop
+        self._playback_segment_start: Optional[float] = None  # where this playing segment began
+        self._playback_started_wall: Optional[float] = None  # time.time() it actually started
+        self._playback_after_id: Optional[str] = None
+        self._play_token = 0  # invalidates in-flight play attempts on pause/stop/replay
+
         self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ---------- UI construction ----------
 
@@ -86,6 +99,18 @@ class SermonTrimmerApp:
             on_region_change=self._on_region_change,
         )
         self.waveform_view.pack(fill="x", padx=8, pady=(4, 8))
+
+        # Playback controls
+        player_frame = ttk.Frame(self.root, padding=(8, 0))
+        player_frame.pack(fill="x")
+        self.play_btn = ttk.Button(player_frame, text="Play", command=self.play_audio, state="disabled")
+        self.play_btn.pack(side="left")
+        self.pause_btn = ttk.Button(player_frame, text="Pause", command=self.pause_audio, state="disabled")
+        self.pause_btn.pack(side="left", padx=6)
+        self.stop_btn = ttk.Button(player_frame, text="Stop", command=self.stop_audio, state="disabled")
+        self.stop_btn.pack(side="left")
+        self.player_status_label = ttk.Label(player_frame, text="", foreground="#555")
+        self.player_status_label.pack(side="left", padx=10)
 
         # In/Out controls: use the selected transcript row if there is one,
         # otherwise fall back to the waveform cursor/region.
@@ -201,7 +226,17 @@ class SermonTrimmerApp:
         self.waveform_view.clear()
         self.status_label.config(text="")
 
+        self._cancel_playback_tick()
+        if self.player:
+            self.player.close()
+            self.player = None
+        self.play_state = "stopped"
+        self._playback_origin = None
+        self.player_status_label.config(text="")
+        self._update_play_button_states()
+
         self.start_waveform_load()
+        self.start_player_load()
 
     # ---------- Waveform ----------
 
@@ -225,6 +260,130 @@ class SermonTrimmerApp:
         self.waveform_view.set_waveform(waveform)
         self.waveform_view.set_markers(self.in_point, self.out_point)
         self.waveform_status_label.config(text=f"Waveform ready ({format_timestamp(waveform.duration)} total).")
+
+    # ---------- Playback ----------
+
+    def start_player_load(self):
+        if not PLAYBACK_AVAILABLE:
+            self.player_status_label.config(text="Playback isn't supported on this OS.")
+            return
+        self.player_status_label.config(text="Preparing audio for playback...")
+        threading.Thread(target=self._run_player_load, daemon=True).start()
+
+    def _run_player_load(self):
+        try:
+            wav_path = decode_to_wav(self.audio_path)
+        except Exception as e:
+            self.root.after(0, lambda: self.player_status_label.config(text=f"Playback unavailable: {e}"))
+            return
+        self.root.after(0, lambda: self._on_player_ready(wav_path))
+
+    def _on_player_ready(self, wav_path: str):
+        self.player = Player(wav_path)
+        self.player_status_label.config(text="")
+        self._update_play_button_states()
+
+    def play_audio(self):
+        if not self.player or self.play_state == "playing":
+            return
+        if self.play_state == "stopped":
+            # Fresh play: from the cursor if there is one, else the In
+            # point if there is one, else the start of the file. Stop
+            # will return here - not to wherever a later pause happened.
+            start = self.cursor_point if self.cursor_point is not None else (
+                self.in_point if self.in_point is not None else 0.0
+            )
+            self._playback_origin = start
+        else:  # "paused" - resume from wherever the cursor currently sits
+            start = self.cursor_point if self.cursor_point is not None else (self._playback_origin or 0.0)
+
+        self._play_token += 1
+        token = self._play_token
+        self.play_state = "playing"
+        self._playback_segment_start = start
+        self._playback_started_wall = time.time()
+        self._update_play_button_states()
+        threading.Thread(target=self._run_play, args=(start, token), daemon=True).start()
+        self._schedule_playback_tick()
+
+    def _run_play(self, start: float, token: int):
+        try:
+            self.player.play_from(start, should_still_play=lambda: self._play_token == token)
+        except Exception as e:
+            self.root.after(0, lambda: self._on_playback_error(str(e)))
+
+    def _on_playback_error(self, message: str):
+        self._play_token += 1
+        self.play_state = "stopped"
+        self._cancel_playback_tick()
+        self._update_play_button_states()
+        messagebox.showerror("Playback failed", message)
+
+    def pause_audio(self):
+        if self.play_state != "playing":
+            return
+        self._play_token += 1
+        self._cancel_playback_tick()
+        self.player.stop_sound()
+        self.play_state = "paused"
+        self._update_play_button_states()
+
+    def stop_audio(self):
+        if self.play_state == "stopped":
+            return
+        self._play_token += 1
+        self._cancel_playback_tick()
+        self.player.stop_sound()
+        self.play_state = "stopped"
+        if self._playback_origin is not None:
+            self._move_playhead(self._playback_origin)
+        self._update_play_button_states()
+
+    def _schedule_playback_tick(self):
+        self._playback_after_id = self.root.after(PLAYBACK_TICK_MS, self._on_playback_tick)
+
+    def _cancel_playback_tick(self):
+        if self._playback_after_id is not None:
+            self.root.after_cancel(self._playback_after_id)
+            self._playback_after_id = None
+
+    def _on_playback_tick(self):
+        self._playback_after_id = None
+        if self.play_state != "playing":
+            return
+        elapsed = time.time() - self._playback_started_wall
+        t = self._playback_segment_start + elapsed
+        if self.duration and t >= self.duration:
+            self._move_playhead(self.duration)
+            self.play_state = "stopped"
+            self._update_play_button_states()
+            return
+        self._move_playhead(t)
+        self._schedule_playback_tick()
+
+    def _update_play_button_states(self):
+        has_player = self.player is not None
+        self.play_btn.config(state="normal" if has_player and self.play_state != "playing" else "disabled")
+        self.pause_btn.config(state="normal" if has_player and self.play_state == "playing" else "disabled")
+        self.stop_btn.config(state="normal" if has_player and self.play_state != "stopped" else "disabled")
+
+    def _move_playhead(self, t: float):
+        """Move the cursor under app control (playback, transcript click)
+        rather than a direct waveform click: updates state, moves the
+        visual cursor on the waveform, and syncs the transcript highlight."""
+        t = max(0.0, t)
+        if self.duration:
+            t = min(t, self.duration)
+        self.cursor_point = t
+        self._sync_markers()
+        self.waveform_view.set_cursor(t)
+        self._select_segment_at(t)
+
+    def _on_close(self):
+        self._cancel_playback_tick()
+        if self.player:
+            self.player.close()
+        self.root.destroy()
 
     # ---------- Transcription ----------
 
@@ -340,10 +499,7 @@ class SermonTrimmerApp:
         idx = int(row_id)
         if not (0 <= idx < len(self.segments)):
             return
-        t = self.segments[idx].start
-        self.cursor_point = t
-        self._sync_markers()
-        self.waveform_view.set_cursor(t)
+        self._move_playhead(self.segments[idx].start)
 
     # ---------- Waveform cursor ----------
 
